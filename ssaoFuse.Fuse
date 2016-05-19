@@ -1,0 +1,309 @@
+FuRegisterClass("ssaoFuse", CT_Tool, {
+	REGS_Category = "OpenCL",
+	REGS_OpIconString = "ambient_occlusion",
+	REGS_OpDescription = " :) ",
+	})
+	
+	
+clsource = [[
+
+// ssaoFuse uses OpenCL to implement the kernel which renders ScreenSpace Ambient Occlusion effect using 32bit Position and Normal AOVs
+// Tested with Fusion 6.3 and 6.4
+// developed by Einar Gabbassov
+
+
+// Dot product of vectors
+float4 MatMultVec(const float4 vec, const float16 mat){
+	float4 out;
+	out.x = dot(vec, mat.lo.lo);
+	out.y = dot(vec, mat.lo.hi);
+	out.z = dot(vec, mat.hi.lo);
+	out.w = dot(vec, mat.hi.hi);
+	return out;
+}
+
+// Get random normal
+float2 getRandom(FuReadImage_t rand_map,float2 uv,int2 size){
+	int2 map_size = (int2)(64,64);
+	uv = convert_float2(uv)*convert_float2(size)/convert_float2(map_size);
+	float4 color_normal = FuSampleImageCf(rand_map,uv,map_size);
+	float2 randVector = color_normal.xy;
+	//randVector = normalize(randVector);
+	float2 randCoord = randVector.xy;
+	return randCoord;
+}
+
+// Reflect the vector
+float2 reflect( float2 i, float2 n ){
+    return i + 2.0 * n * dot(n,i);
+}
+
+// Get the normal vector from the normal AOV
+float3 getNormal(FuReadImage_t img_normal,float2 uv, int2 size){
+	float4 color_normal = FuSampleImageCf(img_normal,uv,size);
+	float3 normal = color_normal.xyz;
+	return normal;
+}
+
+// Get position vector from position AOV
+float3 getPos(FuReadImage_t img_pos,float2 uv, int2 size){
+	float4 color_pos = FuSampleImageCf(img_pos,uv,size);
+	float3 pos = color_pos.xyz;
+	return pos;
+}
+
+// Calculate AO
+float AO(FuReadImage_t img_pos, 
+		 float2 uv,
+		 float3 Position,
+		 float3 Normal,
+		 float2 randomCoord,
+		 int2 size,
+		 float scale,
+		 float intensity,
+		 float bias){
+			float3	pos = Position;
+			float3 N = normalize(Normal);
+			float3 randomVector = getPos(img_pos,uv+randomCoord,size);
+			float3 diff = randomVector - pos;
+			float3 v = normalize(diff);
+			float d = length(diff)*scale;
+			float ao = 1-max(0.0,dot(N,v)-bias)*(1.0/(1.0+d))*intensity;
+			return ao;
+}
+		
+		
+__kernel 
+void ssao(FuReadImage_t img_pos, 
+		  FuReadImage_t img_normal,
+		  FuReadImage_t img_map,
+		  FuWriteImage_t dst,
+		  float rad,
+		  float bias,
+		  float scale,
+		  float intensity,
+		  float x_o,
+		  float y_o,
+		  float z_o){
+	
+	int2 imgSize = get_image_dim(img_pos);
+	float ao = 0;
+	
+	float2 vec[] = {(float2)(1,0),(float2)(-1,0),(float2)(0,1),
+		(float2)(0,-1),(float2)(-2,-2),(float2)(2,2),
+		(float2)(-2,2),(float2)(2,-2),(float2)(1,2),
+		(float2)(2,1),(float2)(2,-1),(float2)(1,-2),
+		(float2)(-1,-2),(float2)(-2,-1),(float2)(-2,1),(float2)(-1,2)};
+	
+	int2 ipos = (int2)(get_global_id(1), get_global_id(0));
+	float2 uv = convert_float2(ipos)/convert_float2(imgSize);
+	float3 pos = getPos(img_pos,uv,imgSize);
+	float3 normal = getNormal(img_normal,uv,imgSize)+(float3)(x_o,y_o,z_o);
+	rad /= pos.z;
+	float2 rand = getRandom(img_map,uv,imgSize);
+	int iteration = 16;
+	
+	for (int j = 0; j < iteration; j ++){
+		float2 coord1 = reflect(vec[j],rand)*rad;
+		float2 coord2 = (float2)(coord1.x*0.707-coord1.y*0.707,coord1.x*0.707+coord1.y*0.707);
+		ao += AO(img_pos,uv,pos,normal,coord1*0.2,imgSize,scale,intensity,bias);
+		ao += AO(img_pos,uv,pos,normal,coord2*0.3,imgSize,scale,intensity,bias);
+		ao += AO(img_pos,uv,pos,normal,coord1*0.4,imgSize,scale,intensity,bias);
+		ao += AO(img_pos,uv,pos,normal,coord2*0.5,imgSize,scale,intensity,bias);
+	}
+	
+	for (int j = 0; j < iteration; j ++){
+		float2 coord1 = reflect(vec[j],rand)*rad;
+		float2 coord2 = (float2)(coord1.x*0.707-coord1.y*0.707,coord1.x*0.707+coord1.y*0.707);
+		ao += AO(img_pos,uv,pos,normal,coord1*0.66,imgSize,scale,intensity,bias);
+		ao += AO(img_pos,uv,pos,normal,coord2*0.75,imgSize,scale,intensity,bias);
+		ao += AO(img_pos,uv,pos,normal,coord1*0.95,imgSize,scale,intensity,bias);
+		ao += AO(img_pos,uv,pos,normal,coord2,imgSize,scale,intensity,bias);
+	}
+
+	ao/=(float)(iteration*4*2);
+	float4 ao_color = (float4)(ao,ao,ao,1);
+	float4 white = FuSampleImageCf (img_pos,uv,imgSize);
+	FuWriteImagef(dst,ipos,imgSize,ao_color);
+}
+]]
+
+function Create()
+	InImagePos = self:AddInput("Position", "Position", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+		INP_AcceptsCLImages = true,
+		})
+	InImageNorm = self:AddInput("Normal", "Normal", {
+		LINKID_DataType = "Image",
+		LINK_Main = 2,
+		INP_Required = false,
+		INP_AcceptsCLImages = true,
+		})
+	InImageMap = self:AddInput("Map", "Map", {
+		LINKID_DataType = "Image",
+		LINK_Main = 3,
+		INP_Required = false,
+		INP_AcceptsCLImages = true,
+		})
+	OutImage = self:AddOutput("Output", "Output", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+		INP_Required = false,
+		INP_AcceptsCLImages = true,
+		})
+	InRad = self:AddInput("occ_radius", "occ_radius", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinAllowed = 0.001,
+		INP_MaxScale = 100,
+		INP_Default = 30,
+		ICD_Center = 30,
+		})
+	InBias = self:AddInput("occ_bias", "occ_bias", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinAllowed = -1,
+		INP_MaxScale = 1,
+		INP_Default = -0.05,
+		ICD_Center = 0,
+		})
+	InScale = self:AddInput("occ_scale", "occ_scale", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinAllowed = 0.001,
+		INP_MaxScale = 10,
+		INP_Default = 0.3,
+		ICD_Center = 1,
+		})
+	InInt = self:AddInput("intensity", "intensity", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinAllowed = 0,
+		INP_MaxScale = 10,
+		INP_Default = 1,
+		ICD_Center = 1,
+		})
+	InX = self:AddInput("x_offset", "x_offset", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinAllowed = -1,
+		INP_MaxScale = 1,
+		INP_Default = 0,
+		ICD_Center = 0,
+		})
+	InY = self:AddInput("y_offset", "y_offset", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinAllowed = -1,
+		INP_MaxScale = 1,
+		INP_Default = 0,
+		ICD_Center = 0,
+		})
+	InZ = self:AddInput("z_offset", "z_offset", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinAllowed = -1,
+		INP_MaxScale = 1,
+		INP_Default = 0,
+		ICD_Center = 0,
+		})
+end
+function OnAddToFlow()
+	mgr = OCLManager()
+	if mgr then
+		prog = mgr:BuildCachedProgram(self.RegNode, clsource)
+	end
+end
+
+function OnRemoveFromFlow()
+	prog = nil
+	mgr = nil
+end
+
+function Process(req)
+	local out
+	local imgPos = InImagePos:GetValue(req)
+	local imgNorm = InImageNorm:GetValue(req)
+	local imgMap = InImageMap:GetValue(req)
+	
+	local radi = InRad:GetValue(req).Value
+	local bias = InBias:GetValue(req).Value
+	local scale = InScale:GetValue(req).Value
+	local intensity = InInt:GetValue(req).Value
+	local x_o = InX:GetValue(req).Value
+	local y_o = InY:GetValue(req).Value
+	local z_o = InZ:GetValue(req).Value
+
+
+
+	local W  = imgPos.DataWindow:Width()
+	local H = imgPos.DataWindow:Height()
+
+	if imgNorm == nil then
+		OutImage:Set(req,imgPos)
+		return
+	end
+	if imgMap == nil then
+		print "empty"
+		OutImage:Set(req,imgNorm)
+		return
+	end
+
+	if prog then 
+		local imgclPos = prog:CreateImage(imgPos, "read")
+		local imgclNorm = prog:CreateImage(imgNorm, "read")
+		local imgclMap = prog:CreateImage(imgMap,"read")
+		if imgclPos then
+			if imgclNorm then
+				if imgclMap then
+						out = Image({
+							MG_Like = imgPos,
+							IMG_NoData = req:IsPreCalc(),
+							IMG_Width = W,
+							IMG_Height = H
+							})
+						local outcl = prog:CreateImage(out,"readwrite")
+						if outcl then
+							kernel = prog:CreateKernel("ssao")
+							if kernel then
+								prog:SetArg(kernel, 0, imgclPos)						
+								prog:SetArg(kernel, 1, imgclNorm)						
+								prog:SetArg(kernel, 2, imgclMap)
+								prog:SetArg(kernel, 3, outcl)  
+								prog:SetArg(kernel, 4, radi)     
+								prog:SetArg(kernel, 5, bias)           
+								prog:SetArg(kernel, 6, scale)   
+								prog:SetArg(kernel, 7, intensity)  
+								prog:SetArg(kernel, 8, x_o)           
+								prog:SetArg(kernel, 9, y_o)           
+								prog:SetArg(kernel, 10, z_o)           
+								
+								success = prog:RunKernel(kernel, false)
+								if success then
+									success = prog:Download(outcl, out)
+									if success then
+										finalout = out
+									end
+								end
+							end
+							--outcl:ReleaseCLObject()
+						end
+					--imgclNorm:ReleaseCLObject()
+				end
+			--imgclPos:ReleaseCLObject()
+			end
+		end
+	end
+	if success then
+		OutImage:Set(req, finalout)
+	else
+		OutImage:Set(req, nil)
+	end
+end
+
+
+
+
+
+
