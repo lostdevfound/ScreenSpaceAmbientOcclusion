@@ -10,3 +10,7 @@ Use the random_normal.tif image as one of the inputs of the ssao node in fusion 
 How to organize the flow:
 ![manual](https://cloud.githubusercontent.com/assets/14153294/15379655/45cd24fe-1d24-11e6-9436-b75352981456.jpg)
 Note: The node labels on the image are color indexed according to the SSAO input ports
+
+Known bugs:
+Sometimes Fusion will temporarily  resize the image view, this can be easily fixed by togling HiQ rendering mode.
+Since the SSAO tool works with sampled images it has some minor artifacts around objects' edjes. 
